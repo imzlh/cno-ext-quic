@@ -156,18 +156,18 @@ declare namespace CModuleExternalQuic {
 
     /* ── Constants ───────────────────────────────────────────────── */
     const constants: {
-        readonly QUICLY_ERROR_PACKET_IGNORED: number;
-        readonly QUICLY_ERROR_FREE_CONNECTION: number;
-        readonly QUICLY_TRANSPORT_ERROR_NO_ERROR: number;
-        readonly QUICLY_TRANSPORT_ERROR_INTERNAL_ERROR: number;
-        readonly QUICLY_TRANSPORT_ERROR_FLOW_CONTROL_ERROR: number;
-        readonly QUICLY_TRANSPORT_ERROR_STREAM_LIMIT_ERROR: number;
-        readonly QUICLY_TRANSPORT_ERROR_STREAM_STATE_ERROR: number;
-        readonly QUICLY_TRANSPORT_ERROR_FINAL_SIZE_ERROR: number;
-        readonly QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION: number;
-        readonly QUICLY_TRANSPORT_ERROR_APPLICATION_ERROR: number;
+        readonly ERROR_PACKET_IGNORED: number;
+        readonly ERROR_FREE_CONNECTION: number;
+        readonly TRANSPORT_ERROR_NO_ERROR: number;
+        readonly TRANSPORT_ERROR_INTERNAL_ERROR: number;
+        readonly TRANSPORT_ERROR_FLOW_CONTROL_ERROR: number;
+        readonly TRANSPORT_ERROR_STREAM_LIMIT_ERROR: number;
+        readonly TRANSPORT_ERROR_STREAM_STATE_ERROR: number;
+        readonly TRANSPORT_ERROR_FINAL_SIZE_ERROR: number;
+        readonly TRANSPORT_ERROR_PROTOCOL_VIOLATION: number;
+        readonly TRANSPORT_ERROR_APPLICATION_ERROR: number;
     };
 
-    export { Socket as QuicSocket, Connection as QuicConnection, constants };
-    export type { SocketOptions as QuicSocketOptions, Stats as QuicStats, Callback };
+    export { Socket, Connection, constants };
+    export type { SocketOptions, Stats, Callback };
 }

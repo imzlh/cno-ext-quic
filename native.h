@@ -5,8 +5,10 @@
 #include <quicly/defaults.h>
 #include <picotls.h>
 #include <picotls/openssl.h>
+#define FOREIGN_QJS
 #include <quickjs.h>
 #include <quickjs-libc.h>
+#include <tjs.h>   /* DEF_MODULE, TJSModuleInfo, TJS_EXPORT */
 #include <uv.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -49,7 +51,7 @@ static inline JSValue qc_call_cb(JSContext *ctx, JSValue cb,
 #define QC_CALL(ctx, cbs, idx, argc, argv) \
     do { \
         JSValue _r = qc_call_cb(ctx, (cbs)[idx], argc, argv); \
-        if (JS_IsException(_r)) js_std_dump_error(ctx); \
+        if (JS_IsException(_r)) TJS_DumpException(ctx); \
         JS_FreeValue(ctx, _r); \
     } while(0)
 
@@ -108,6 +110,6 @@ static inline QuicConn *qc_conn_from_js(JSContext *ctx, JSValue val) {
     return JS_GetOpaque(val, qc_conn_class_id);
 }
 
-JSModuleDef *js_init_module_quicly(JSContext *ctx, const char *name);
+void qc_ns_init(JSContext *ctx, JSValue ns);
 
 #endif /* QUICLY_CIRCU_H */

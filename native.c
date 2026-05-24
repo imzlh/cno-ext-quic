@@ -761,7 +761,8 @@ static const JSCFunctionListEntry qc_sock_proto[] = {
 /* ── Constants ────────────────────────────────────────────────── */
 static JSValue make_constants(JSContext *ctx) {
     JSValue o = JS_NewObject(ctx);
-#define C(x) JS_SetPropertyStr(ctx, o, #x, JS_NewInt32(ctx, x))
+    // strip 
+#define C(x) JS_SetPropertyStr(ctx, o, #x + 7, JS_NewInt32(ctx, x))
     C(QUICLY_ERROR_PACKET_IGNORED);
     C(QUICLY_ERROR_FREE_CONNECTION);
     C(QUICLY_TRANSPORT_ERROR_NO_ERROR);
@@ -776,8 +777,14 @@ static JSValue make_constants(JSContext *ctx) {
     return o;
 }
 
-/* ── Module init ──────────────────────────────────────────────── */
-static int js_init_module_quicly(JSContext *ctx, JSModuleDef *m) {
+/* ── Module init ──────────────────────────────────────────────────
+ * Init function is exposed (non-static) so it can be statically
+ * linked into a host like cno-cli. When CJS_STATIC_LINK is defined,
+ * we skip DEF_MODULE — its emitted `tjs_module_info` symbol would
+ * collide with other statically linked extensions in the same binary.
+ */
+
+void qc_ns_init(JSContext *ctx, JSValue ns) {
     /* QuicConnection class */
     JS_NewClassID(&qc_conn_class_id);
     JS_NewClass(JS_GetRuntime(ctx), qc_conn_class_id, &qc_conn_class);
@@ -796,15 +803,10 @@ static int js_init_module_quicly(JSContext *ctx, JSModuleDef *m) {
     JS_SetConstructor(ctx, sock_ctor, sock_proto);
     JS_SetClassProto(ctx, qc_sock_class_id, sock_proto);
 
-    JS_SetModuleExport(ctx, m, "Socket",  sock_ctor);
-    JS_SetModuleExport(ctx, m, "constants",   make_constants(ctx));
-    return m;
+    JS_SetPropertyStr(ctx, ns, "Socket",    sock_ctor);
+    JS_SetPropertyStr(ctx, ns, "constants", make_constants(ctx));
 }
 
-JSModuleDef *js_init_module_quicly(JSContext *ctx, const char *name) {
-    JSModuleDef *m = JS_NewCModule(ctx, name, js_init_module_quicly);
-    if (!m) return NULL;
-    JS_AddModuleExport(ctx, m, "Socket");
-    JS_AddModuleExport(ctx, m, "constants");
-    return m;
-}
+#ifndef CJS_STATIC_LINK
+DEF_MODULE("ext:quic", qc_ns_init, false)
+#endif
