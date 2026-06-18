@@ -26,9 +26,10 @@
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 #include <openssl/err.h>
+#include <threads.h>
 
-JSClassID qc_conn_class_id;
-JSClassID qc_sock_class_id;
+thread_local JSClassID qc_conn_class_id;
+thread_local JSClassID qc_sock_class_id;
 static void qconn_flush(QuicConn *c);
 static void qsock_update_timer(QuicSock *s);
 static QuicConn *qsock_find_conn(QuicSock *s, quicly_conn_t *qc);
