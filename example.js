@@ -261,12 +261,16 @@ export function createRpcClient({ host = "127.0.0.1", port = 4434 }) {
  * ══════════════════════════════════════════════════════════════════ */
 
 // --- Echo ---
-// const server = startEchoServer({ cert: "cert.pem", key: "key.pem" });
+// const cert = fs.readTextFileSync("cert.pem");
+// const key  = fs.readTextFileSync("key.pem");
+// const server = startEchoServer({ cert, key });
 // const results = await echoClient({ messages: ["hello", "world"] });
 
 // --- RPC ---
+// const cert = fs.readTextFileSync("cert.pem");
+// const key  = fs.readTextFileSync("key.pem");
 // const server = startRpcServer({
-//     cert: "cert.pem", key: "key.pem", port: 4434,
+//     cert, key, port: 4434,
 //     handlers: {
 //         add:  ({ a, b }) => a + b,
 //         echo: ({ msg }) => msg,

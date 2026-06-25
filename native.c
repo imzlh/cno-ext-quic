@@ -26,6 +26,9 @@
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 #include <openssl/err.h>
+#if defined(_MSC_VER)
+#include <openssl/applink.c>
+#endif
 #include <threads.h>
 
 thread_local JSClassID qc_conn_class_id;
@@ -80,6 +83,11 @@ static void qsock_udp_send(QuicSock *s, const struct sockaddr *dest,
 
 /* ── quicly send loop ─────────────────────────────────────────── */
 static void qconn_flush(QuicConn *c) {
+    if (c->sock->in_receive) {
+        c->sock->pending_flush = 1;
+        return;
+    }
+
     quicly_address_t dest, src;
     struct iovec     dgrams[DGRAM_BATCH];
     uint8_t          buf[DGRAM_BATCH * MAX_PKT_SIZE];
@@ -129,16 +137,15 @@ static void qsock_update_timer(QuicSock *s) {
 }
 
 /* ── quicly stream callbacks ──────────────────────────────────── */
-static void stream_on_destroy(quicly_stream_t *stream, int err) {
-    (void)err;
-    /* stream->data is QuicConn *, nothing to free here */
-    (void)stream;
+static void stream_on_destroy(quicly_stream_t *stream, quicly_error_t err) {
+    quicly_streambuf_destroy(stream, err);
 }
 
 static void stream_on_receive(quicly_stream_t *stream, size_t off,
                                const void *src, size_t len) {
     (void)off;
-    QuicConn  *c   = stream->data;
+    QuicStreamData *sd = stream->data;
+    QuicConn  *c   = sd->conn;
     JSContext *ctx = c->ctx;
     bool fin       = quicly_recvstate_transfer_complete(&stream->recvstate);
     JSValue argv[3] = {
@@ -153,8 +160,9 @@ static void stream_on_receive(quicly_stream_t *stream, size_t off,
     quicly_stream_sync_recvbuf(stream, len);
 }
 
-static void stream_on_receive_reset(quicly_stream_t *stream, int err) {
-    QuicConn  *c   = stream->data;
+static void stream_on_receive_reset(quicly_stream_t *stream, quicly_error_t err) {
+    QuicStreamData *sd = stream->data;
+    QuicConn  *c   = sd->conn;
     JSContext *ctx = c->ctx;
     JSValue argv[2] = {
         JS_NewFloat64(ctx, (double)stream->stream_id),
@@ -167,21 +175,21 @@ static void stream_on_receive_reset(quicly_stream_t *stream, int err) {
 
 static const quicly_stream_callbacks_t stream_cbs = {
     .on_destroy       = stream_on_destroy,
-    .on_send_shift    = quicly_streambuf_send_shift,
-    .on_send_emit     = quicly_streambuf_send_emit,
+    .on_send_shift    = quicly_streambuf_egress_shift,
+    .on_send_emit     = quicly_streambuf_egress_emit,
     .on_send_stop     = NULL,
     .on_receive       = stream_on_receive,
     .on_receive_reset = stream_on_receive_reset,
 };
 
 /* ── quicly connection callbacks ──────────────────────────────── */
-static int on_stream_open(quicly_stream_open_t *self, quicly_stream_t *stream) {
+static quicly_error_t on_stream_open(quicly_stream_open_t *self, quicly_stream_t *stream) {
     QuicSock *s  = container_of(self, QuicSock, on_stream_open_cb);
     QuicConn *c  = qsock_find_conn(s, stream->conn);
     if (!c) return QUICLY_ERROR_PACKET_IGNORED;
-    stream->data = c;
-    quicly_streambuf_create(stream, sizeof(quicly_streambuf_t));
-    quicly_stream_set_callbacks(stream, &stream_cbs);
+    quicly_streambuf_create(stream, sizeof(QuicStreamData));
+    ((QuicStreamData *)stream->data)->conn = c;
+    stream->callbacks = &stream_cbs;
     JSValue argv[2] = {
         JS_NewFloat64(s->ctx, (double)stream->stream_id),
         JS_NewBool(s->ctx, STREAM_IS_BIDI(stream->stream_id)),
@@ -192,17 +200,19 @@ static int on_stream_open(quicly_stream_open_t *self, quicly_stream_t *stream) {
     return 0;
 }
 
-static void on_closed_by_remote(quicly_closed_by_remote_t *self,
-                                 quicly_conn_t *qconn, int err,
-                                 uint64_t frame_type,
-                                 const char *reason, size_t reason_len) {
+static void on_closed(quicly_closed_t *self, quicly_conn_t *qconn) {
+    uint64_t frame_type;
+    const char *reason;
+    int is_remote;
+    int err = quicly_get_close_reason(qconn, &frame_type, &reason, &is_remote);
     (void)frame_type;
-    QuicSock *s = container_of(self, QuicSock, on_closed_remote_cb);
+    (void)is_remote;
+    QuicSock *s = container_of(self, QuicSock, on_closed_cb);
     QuicConn *c = qsock_find_conn(s, qconn);
     if (!c) return;
     JSValue argv[2] = {
         JS_NewInt32(s->ctx, err),
-        JS_NewStringLen(s->ctx, reason, reason_len),
+        JS_NewString(s->ctx, reason ? reason : ""),
     };
     QC_CALL(s->ctx, c->callbacks, QC_CB_CLOSE, 2, argv);
     JS_FreeValue(s->ctx, argv[0]);
@@ -235,8 +245,7 @@ static void on_udp_recv(uv_udp_t *h, ssize_t nread, const uv_buf_t *buf,
     QuicSock *s = container_of(h, QuicSock, udp);
 
     /* Decode packet to find/create connection */
-    quicly_decoded_packet_t pkt[4];
-    size_t                  npkts;
+    quicly_decoded_packet_t pkt;
     size_t                  off = 0;
     quicly_address_t        local, remote;
 
@@ -246,19 +255,19 @@ static void on_udp_recv(uv_udp_t *h, ssize_t nread, const uv_buf_t *buf,
            ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in));
 
     while (off < (size_t)nread) {
-        size_t n = quicly_decode_packet(&s->qctx, pkt,
-                                         (const uint8_t *)buf->base + off,
-                                         (size_t)nread - off, &npkts);
+        size_t n = quicly_decode_packet(&s->qctx, &pkt,
+                                         (const uint8_t *)buf->base,
+                                         (size_t)nread, &off);
         if (n == SIZE_MAX) break;
 
-        for (size_t i = 0; i < npkts; i++) {
+        {
             QuicConn *c = NULL;
 
             /* Try to find existing connection */
             for (int j = 0; j < MAX_CONNS; j++) {
                 if (!s->conns[j]) continue;
                 if (quicly_is_destination(s->conns[j]->qconn, NULL,
-                                          &remote.sa, &pkt[i])) {
+                                          &remote.sa, &pkt)) {
                     c = s->conns[j];
                     break;
                 }
@@ -268,7 +277,7 @@ static void on_udp_recv(uv_udp_t *h, ssize_t nread, const uv_buf_t *buf,
                 /* New inbound connection */
                 quicly_conn_t *qconn = NULL;
                 int rc = quicly_accept(&qconn, &s->qctx, NULL, &remote.sa,
-                                        &pkt[i], NULL, &s->next_cid, NULL);
+                                        &pkt, NULL, &s->next_cid, NULL, NULL);
                 if (rc != 0 || !qconn) continue;
 
                 c = calloc(1, sizeof(QuicConn));
@@ -296,7 +305,9 @@ static void on_udp_recv(uv_udp_t *h, ssize_t nread, const uv_buf_t *buf,
 
             if (!c) continue; /* client: unknown packet, drop */
 
-            quicly_receive(c->qconn, NULL, &remote.sa, &pkt[i]);
+            s->in_receive++;
+            quicly_receive(c->qconn, NULL, &remote.sa, &pkt);
+            s->in_receive--;
 
             /* Notify JS if handshake just completed */
             if (quicly_connection_is_ready(c->qconn)) {
@@ -307,37 +318,41 @@ static void on_udp_recv(uv_udp_t *h, ssize_t nread, const uv_buf_t *buf,
             }
 
             qconn_flush(c);
+            if (s->pending_flush && !s->in_receive) {
+                s->pending_flush = 0;
+                for (int j = 0; j < MAX_CONNS; j++) {
+                    if (s->conns[j]) qconn_flush(s->conns[j]);
+                }
+            }
         }
-        off += n;
+        (void)n;
     }
     free(buf->base);
 }
 
 /* ── TLS / picotls helpers ────────────────────────────────────── */
-static int load_cert_chain(QuicSock *s, const char *cert_path) {
-    FILE *f = fopen(cert_path, "r");
-    if (!f) return -1;
+static int load_cert_chain(QuicSock *s, const char *pem) {
+    BIO *bio = BIO_new_mem_buf(pem, -1);
+    if (!bio) return -1;
     X509 *x;
-    while ((x = PEM_read_X509(f, NULL, NULL, NULL)) != NULL &&
-            s->ncerts < 8) {
+    while (s->ncerts < 8 && (x = PEM_read_bio_X509(bio, NULL, NULL, NULL)) != NULL) {
         unsigned char *der = NULL;
-        int            len = i2d_X509(x, &der);
-        if (len > 0) {
-            s->certs[s->ncerts].base = der;
-            s->certs[s->ncerts].len  = (size_t)len;
-            s->ncerts++;
-        }
+        int len = i2d_X509(x, &der);
         X509_free(x);
+        if (len <= 0) continue;
+        s->certs[s->ncerts].base = der;
+        s->certs[s->ncerts].len  = (size_t)len;
+        s->ncerts++;
     }
-    fclose(f);
+    BIO_free(bio);
     return s->ncerts > 0 ? 0 : -1;
 }
 
-static int load_private_key(QuicSock *s, const char *key_path) {
-    FILE     *f    = fopen(key_path, "r");
-    if (!f) return -1;
-    EVP_PKEY *pkey = PEM_read_PrivateKey(f, NULL, NULL, NULL);
-    fclose(f);
+static int load_private_key(QuicSock *s, const char *pem) {
+    BIO *bio = BIO_new_mem_buf(pem, -1);
+    if (!bio) return -1;
+    EVP_PKEY *pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
+    BIO_free(bio);
     if (!pkey) return -1;
     ptls_openssl_init_sign_certificate(&s->sign_cert, pkey);
     EVP_PKEY_free(pkey);
@@ -370,24 +385,10 @@ static JSValue js_conn_open_stream(JSContext *ctx, JSValue this_val,
     quicly_stream_t *stream;
     int rc = quicly_open_stream(c->qconn, &stream, !bidi);
     if (rc != 0) return JS_ThrowInternalError(ctx, "open_stream: %d", rc);
-    quicly_streambuf_create(stream, sizeof(quicly_streambuf_t));
-    quicly_stream_set_callbacks(stream, &stream_cbs);
-    stream->data = c;
-
-    /* Optional priority: { urgency?: 0-7, incremental?: bool } */
-    if (argc >= 2 && JS_IsObject(argv[1])) {
-        quicly_stream_priority_t pri = { .urgency = 3, .incremental = 0 };
-        JSValue v;
-        v = JS_GetPropertyStr(ctx, argv[1], "urgency");
-        if (!JS_IsUndefined(v)) {
-            uint32_t u; JS_ToUint32(ctx, &u, v);
-            pri.urgency = u > 7 ? 7 : (uint8_t)u;
-        }
-        JS_FreeValue(ctx, v);
-        v = JS_GetPropertyStr(ctx, argv[1], "incremental");
-        if (!JS_IsUndefined(v)) pri.incremental = JS_ToBool(ctx, v);
-        JS_FreeValue(ctx, v);
-        quicly_stream_set_priority(stream, &pri);
+    if (stream->data == NULL) {
+        quicly_streambuf_create(stream, sizeof(QuicStreamData));
+        ((QuicStreamData *)stream->data)->conn = c;
+        stream->callbacks = &stream_cbs;
     }
 
     qconn_flush(c);
@@ -411,7 +412,6 @@ static JSValue js_conn_send_stream(JSContext *ctx, JSValue this_val,
     ptr = JS_GetArrayBuffer(ctx, &len, argv[1]);
     ab_ref = JS_UNDEFINED;
     if (!ptr) {
-        JS_ClearException(ctx);
         size_t blen;
         JSValue ab = JS_GetTypedArrayBuffer(ctx, argv[1], &off, &blen, NULL);
         if (!JS_IsException(ab)) {
@@ -452,7 +452,7 @@ static JSValue js_conn_stop_sending(JSContext *ctx, JSValue this_val,
     JS_ToIndex(ctx, &sid, argv[0]);
     if (argc >= 2) JS_ToUint32(ctx, &code, argv[1]);
     quicly_stream_t *stream = quicly_get_stream(c->qconn, (int64_t)sid);
-    if (stream) quicly_stop_sending(stream, code);
+    if (stream) quicly_request_stop(stream, QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(code));
     qconn_flush(c);
     return JS_UNDEFINED;
 }
@@ -539,6 +539,22 @@ static const JSCFunctionListEntry qc_conn_proto[] = {
 };
 
 /* ── QuicSocket JS class ──────────────────────────────────────── */
+
+static const char *opt_str(JSContext *ctx, JSValue obj, const char *k) {
+    JSValue v = JS_GetPropertyStr(ctx, obj, k);
+    if (!JS_IsString(v)) { JS_FreeValue(ctx, v); return NULL; }
+    const char *s = JS_ToCString(ctx, v);
+    JS_FreeValue(ctx, v);
+    return s;
+}
+
+static uint32_t opt_u32(JSContext *ctx, JSValue obj, const char *k, uint32_t def) {
+    JSValue v = JS_GetPropertyStr(ctx, obj, k);
+    if (JS_IsUndefined(v) || JS_IsNull(v)) return def;
+    uint32_t n = def;
+    JS_ToUint32(ctx, &n, v);
+    return n;
+}
 static void qc_sock_finalizer(JSRuntime *rt, JSValue val) {
     QuicSock *s = JS_GetOpaque(val, qc_sock_class_id);
     if (!s) return;
@@ -553,6 +569,7 @@ static void qc_sock_finalizer(JSRuntime *rt, JSValue val) {
     }
     for (int i = 0; i < QS_CB_COUNT; i++) JS_FreeValueRT(rt, s->callbacks[i]);
     for (size_t i = 0; i < s->ncerts; i++) OPENSSL_free(s->certs[i].base);
+    free(s->alpn_storage);
     free(s);
 }
 
@@ -560,6 +577,21 @@ static JSClassDef qc_sock_class = { "Socket", .finalizer = qc_sock_finalizer };
 
 static inline QuicSock *sock_get(JSContext *ctx, JSValue v) {
     return JS_GetOpaque2(ctx, v, qc_sock_class_id);
+}
+
+static int on_client_hello(ptls_on_client_hello_t *self, ptls_t *tls,
+                           ptls_on_client_hello_parameters_t *params) {
+    QuicSock *s = container_of(self, QuicSock, on_client_hello_cb);
+    if (s->alpn.len == 0) return 0;
+
+    for (size_t i = 0; i < params->negotiated_protocols.count; i++) {
+        ptls_iovec_t offered = params->negotiated_protocols.list[i];
+        if (offered.len == s->alpn.len &&
+            memcmp(offered.base, s->alpn.base, s->alpn.len) == 0) {
+            return ptls_set_negotiated_protocol(tls, (const char *)s->alpn.base, s->alpn.len);
+        }
+    }
+    return PTLS_ALERT_NO_APPLICATION_PROTOCOL;
 }
 
 /* ── Transport params / CC helpers ────────────────────────────── */
@@ -600,10 +632,7 @@ static void apply_transport_params(JSContext *ctx, JSValue opts,
     JS_FreeValue(ctx, v);
 
     v = JS_GetPropertyStr(ctx, t, "initialRttMs");
-    if (!JS_IsUndefined(v)) {
-        JS_ToUint32(ctx, &u, v);
-        qctx->loss->initial_rtt = u;
-    }
+    (void)u;
     JS_FreeValue(ctx, v);
 
     v = JS_GetPropertyStr(ctx, t, "cc");
@@ -620,12 +649,17 @@ static void apply_transport_params(JSContext *ctx, JSValue opts,
     JS_FreeValue(ctx, t);
 }
 
-/* QuicSocket constructor: new QuicSocket({ host, port, cert, key, isServer, alpn? }) */
+/* QuicSocket constructor: new QuicSocket({ host, port, cert, key, isServer, alpn? })
+ * cert/key are PEM strings (not file paths). */
 static JSValue js_sock_ctor(JSContext *ctx, JSValue new_target,
                              int argc, JSValue *argv) {
-    if (argc < 1) return JS_ThrowTypeError(ctx, "Socket(opts) requires at least one argument");
+    if (argc < 1)
+        return JS_ThrowTypeError(ctx, "Socket(opts) requires at least one argument");
 
-    uv_loop_t *loop = TJS_GetLoop(ctx);
+    uv_loop_t *loop = TJS_GetLoop(TJS_GetRuntime(ctx));
+    JSValue opts     = argv[0];
+    JSValue obj      = JS_UNDEFINED;
+    const char *host = NULL, *cert = NULL, *key = NULL, *alpn_str = NULL;
 
     QuicSock *s = calloc(1, sizeof(QuicSock));
     if (!s) return JS_ThrowOutOfMemory(ctx);
@@ -634,70 +668,73 @@ static JSValue js_sock_ctor(JSContext *ctx, JSValue new_target,
     for (int i = 0; i < QS_CB_COUNT; i++) s->callbacks[i] = JS_NULL;
 
     /* Parse options */
-    JSValue opts = argv[0];
-#define GETSTR(k) JS_ToCString(ctx, JS_GetPropertyStr(ctx, opts, k))
-    const char *host   = GETSTR("host");
-    const char *cert   = GETSTR("cert");
-    const char *key    = GETSTR("key");
-    JSValue jport      = JS_GetPropertyStr(ctx, opts, "port");
-    JSValue jserver    = JS_GetPropertyStr(ctx, opts, "isServer");
-    uint32_t port      = 4433;
-    JS_ToUint32(ctx, &port, jport);
-    s->is_server       = JS_ToBool(ctx, jserver);
-    JS_FreeValue(ctx, jport);
-    JS_FreeValue(ctx, jserver);
-#undef GETSTR
+    host      = opt_str(ctx, opts, "host");
+    cert      = opt_str(ctx, opts, "cert");
+    key       = opt_str(ctx, opts, "key");
+    alpn_str  = opt_str(ctx, opts, "alpn");
+    uint32_t port     = opt_u32(ctx, opts, "port", 4433);
+    s->is_server      = JS_ToBool(ctx, JS_GetPropertyStr(ctx, opts, "isServer"));
 
     /* TLS setup */
-    s->tls.random_bytes   = ptls_openssl_random_bytes;
-    s->tls.get_time       = &ptls_get_time;
-    s->tls.key_exchanges  = ptls_openssl_key_exchanges;
-    s->tls.cipher_suites  = ptls_openssl_cipher_suites;
-    s->tls.certificates.list  = s->certs;
-    s->tls.certificates.count = 0;
+    s->tls.random_bytes         = ptls_openssl_random_bytes;
+    s->tls.get_time             = &ptls_get_time;
+    s->tls.key_exchanges        = ptls_openssl_key_exchanges;
+    s->tls.cipher_suites        = ptls_openssl_cipher_suites;
+    s->tls.certificates.list    = s->certs;
+    s->tls.certificates.count   = 0;
 
-    /* ALPN - default "" if not specified */
-    JSValue jalpn = JS_GetPropertyStr(ctx, opts, "alpn");
-    const char *alpn_str = JS_IsString(jalpn) ? JS_ToCString(ctx, jalpn) : NULL;
-    static ptls_iovec_t alpn_list[1];
+    /* ALPN */
     if (alpn_str) {
-        alpn_list[0] = ptls_iovec_init(alpn_str, strlen(alpn_str));
-        s->tls.negotiated_protocols =
-            (ptls_negotiate_protocol_t){ .list = alpn_list, .count = 1 };
+        size_t len = strlen(alpn_str);
+        s->alpn_storage = malloc(len + 1);
+        if (!s->alpn_storage) goto oom;
+        memcpy(s->alpn_storage, alpn_str, len + 1);
+        s->alpn                    = ptls_iovec_init(s->alpn_storage, len);
+        s->on_client_hello_cb.cb   = on_client_hello;
+        s->tls.on_client_hello     = &s->on_client_hello_cb;
     }
-    JS_FreeValue(ctx, jalpn);
 
+    /* Cert / key (PEM strings) */
     if (cert && load_cert_chain(s, cert) == 0)
         s->tls.certificates.count = s->ncerts;
     if (key) load_private_key(s, key);
-    JS_FreeCString(ctx, cert);
-    JS_FreeCString(ctx, key);
 
-    /* quicly context - start from defaults */
-    s->qctx                          = quicly_spec_context;
-    s->qctx.tls                      = &s->tls;
-    s->qctx.stream_open              = &s->on_stream_open_cb;
-    s->qctx.closed_by_remote         = &s->on_closed_remote_cb;
-    s->qctx.receive_datagram_frame   = &s->on_datagram_cb;
-    s->on_stream_open_cb.cb          = on_stream_open;
-    s->on_closed_remote_cb.cb        = on_closed_by_remote;
-    s->on_datagram_cb.cb             = on_receive_datagram_frame;
+    /* quicly context */
+    s->qctx = quicly_spec_context;
+    s->qctx.tls = &s->tls;
+    quicly_amend_ptls_context(s->qctx.tls);
+    s->qctx.transport_params.max_datagram_frame_size =
+        s->qctx.transport_params.max_udp_payload_size;
+    s->qctx.stream_open            = &s->on_stream_open_cb;
+    s->qctx.closed                 = &s->on_closed_cb;
+    s->qctx.receive_datagram_frame = &s->on_datagram_cb;
+    s->on_stream_open_cb.cb        = on_stream_open;
+    s->on_closed_cb.cb             = on_closed;
+    s->on_datagram_cb.cb           = on_receive_datagram_frame;
     apply_transport_params(ctx, opts, &s->qctx);
 
-    /* UDP socket */
+    /* UDP */
     uv_udp_init(loop, &s->udp);
     struct sockaddr_in addr;
     uv_ip4_addr(host ? host : "0.0.0.0", (int)port, &addr);
     if (s->is_server)
         uv_udp_bind(&s->udp, (struct sockaddr *)&addr, 0);
     uv_udp_recv_start(&s->udp, on_udp_alloc, on_udp_recv);
-    JS_FreeCString(ctx, host);
 
     /* Timer */
     uv_timer_init(loop, &s->timer);
 
-    JSValue obj = JS_NewObjectClass(ctx, qc_sock_class_id);
+    obj = JS_NewObjectClass(ctx, qc_sock_class_id);
     JS_SetOpaque(obj, s);
+    goto done;
+
+oom:
+    JS_ThrowOutOfMemory(ctx);
+done:
+    JS_FreeCString(ctx, host);
+    JS_FreeCString(ctx, cert);
+    JS_FreeCString(ctx, key);
+    JS_FreeCString(ctx, alpn_str);
     return obj;
 }
 
@@ -713,10 +750,10 @@ static JSValue js_sock_connect(JSContext *ctx, JSValue this_val,
 
     struct sockaddr_in remote;
     uv_ip4_addr(host, (int)port, &remote);
-    JS_FreeCString(ctx, host);
 
     QuicConn *c = calloc(1, sizeof(QuicConn));
     if (!c || qsock_add_conn(s, c) != 0) {
+        JS_FreeCString(ctx, host);
         free(c);
         return JS_ThrowInternalError(ctx, "too many connections");
     }
@@ -724,9 +761,16 @@ static JSValue js_sock_connect(JSContext *ctx, JSValue this_val,
     c->ctx  = ctx;
     for (int i = 0; i < QC_CB_COUNT; i++) c->callbacks[i] = JS_NULL;
 
+    ptls_handshake_properties_t hs_properties = { 0 };
+    if (s->alpn.len != 0) {
+        hs_properties.client.negotiated_protocols.list = &s->alpn;
+        hs_properties.client.negotiated_protocols.count = 1;
+    }
+
     int rc = quicly_connect(&c->qconn, &s->qctx, host,
                              (struct sockaddr *)&remote, NULL,
-                             &s->next_cid, ptls_iovec_init(NULL, 0), NULL, NULL);
+                             &s->next_cid, ptls_iovec_init(NULL, 0), &hs_properties, NULL, NULL);
+    JS_FreeCString(ctx, host);
     if (rc != 0) {
         qsock_remove_conn(s, c);
         free(c);
@@ -763,17 +807,17 @@ static const JSCFunctionListEntry qc_sock_proto[] = {
 static JSValue make_constants(JSContext *ctx) {
     JSValue o = JS_NewObject(ctx);
     // strip 
-#define C(x) JS_SetPropertyStr(ctx, o, #x + 7, JS_NewInt32(ctx, x))
+#define C(x) JS_SetPropertyStr(ctx, o, #x + 7, JS_NewFloat64(ctx, (double)(x)))
     C(QUICLY_ERROR_PACKET_IGNORED);
     C(QUICLY_ERROR_FREE_CONNECTION);
-    C(QUICLY_TRANSPORT_ERROR_NO_ERROR);
-    C(QUICLY_TRANSPORT_ERROR_INTERNAL_ERROR);
-    C(QUICLY_TRANSPORT_ERROR_FLOW_CONTROL_ERROR);
-    C(QUICLY_TRANSPORT_ERROR_STREAM_LIMIT_ERROR);
-    C(QUICLY_TRANSPORT_ERROR_STREAM_STATE_ERROR);
-    C(QUICLY_TRANSPORT_ERROR_FINAL_SIZE_ERROR);
+    C(QUICLY_TRANSPORT_ERROR_NONE);
+    C(QUICLY_TRANSPORT_ERROR_INTERNAL);
+    C(QUICLY_TRANSPORT_ERROR_FLOW_CONTROL);
+    C(QUICLY_TRANSPORT_ERROR_STREAM_LIMIT);
+    C(QUICLY_TRANSPORT_ERROR_STREAM_STATE);
+    C(QUICLY_TRANSPORT_ERROR_FINAL_SIZE);
     C(QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION);
-    C(QUICLY_TRANSPORT_ERROR_APPLICATION_ERROR);
+    C(QUICLY_TRANSPORT_ERROR_APPLICATION);
 #undef C
     return o;
 }
@@ -786,16 +830,17 @@ static JSValue make_constants(JSContext *ctx) {
  */
 
 void qc_ns_init(JSContext *ctx, JSValue ns) {
+    JSRuntime *rt = JS_GetRuntime(ctx);
     /* QuicConnection class */
-    JS_NewClassID(&qc_conn_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), qc_conn_class_id, &qc_conn_class);
+    JS_NewClassID(rt, &qc_conn_class_id);
+    JS_NewClass(rt, qc_conn_class_id, &qc_conn_class);
     JSValue conn_proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, conn_proto, qc_conn_proto, countof(qc_conn_proto));
     JS_SetClassProto(ctx, qc_conn_class_id, conn_proto);
 
     /* QuicSocket class */
-    JS_NewClassID(&qc_sock_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), qc_sock_class_id, &qc_sock_class);
+    JS_NewClassID(rt, &qc_sock_class_id);
+    JS_NewClass(rt, qc_sock_class_id, &qc_sock_class);
     JSValue sock_proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, sock_proto, qc_sock_proto, countof(qc_sock_proto));
 

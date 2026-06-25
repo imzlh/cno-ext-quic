@@ -3,6 +3,7 @@
 
 #include <quicly.h>
 #include <quicly/defaults.h>
+#include <quicly/streambuf.h>
 #include <picotls.h>
 #include <picotls/openssl.h>
 #define FOREIGN_QJS
@@ -14,6 +15,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include <threads.h>
+
+#ifndef countof
+#define countof(x) (sizeof(x) / sizeof((x)[0]))
+#endif
 
 /* ── QuicConnection callback indices ──────────────────────────── */
 typedef enum {
@@ -39,7 +45,7 @@ static inline JSValue qc_call_cb(JSContext *ctx, JSValue cb,
                                   int argc, JSValue *argv) {
     if (JS_IsFunction(ctx, cb))
         return JS_Call(ctx, cb, JS_UNDEFINED, argc, argv);
-    if (!JS_IsArray(ctx, cb)) return JS_UNDEFINED;
+    if (!JS_IsArray(cb)) return JS_UNDEFINED;
     JSValue fn   = JS_GetPropertyUint32(ctx, cb, 0);
     JSValue self = JS_GetPropertyUint32(ctx, cb, 1);
     JSValue ret  = JS_Call(ctx, fn, self, argc, argv);
@@ -63,8 +69,8 @@ static inline JSValue qc_call_cb(JSContext *ctx, JSValue cb,
 #define DGRAM_BATCH         16
 #define MAX_PKT_SIZE        1452  /* typical QUIC MTU */
 
-extern JSClassID qc_conn_class_id;
-extern JSClassID qc_sock_class_id;
+extern thread_local JSClassID qc_conn_class_id;
+extern thread_local JSClassID qc_sock_class_id;
 
 /* ── Structs (exposed for H3 and other extension layers) ─────── */
 typedef struct QuicSock QuicSock;
@@ -78,6 +84,11 @@ struct QuicConn {
     JSValue        callbacks[QC_CB_COUNT];
 };
 
+typedef struct QuicStreamData {
+    quicly_streambuf_t buf;
+    QuicConn *conn;
+} QuicStreamData;
+
 struct QuicSock {
     uv_udp_t                        udp;
     uv_timer_t                      timer;
@@ -85,14 +96,19 @@ struct QuicSock {
     JSContext                      *ctx;
     quicly_context_t                qctx;
     ptls_context_t                  tls;
+    ptls_on_client_hello_t          on_client_hello_cb;
     ptls_openssl_sign_certificate_t sign_cert;
     ptls_iovec_t                    certs[8];
     size_t                          ncerts;
+    char                           *alpn_storage;
+    ptls_iovec_t                    alpn;
     quicly_stream_open_t            on_stream_open_cb;
-    quicly_closed_by_remote_t       on_closed_remote_cb;
+    quicly_closed_t                 on_closed_cb;
     quicly_receive_datagram_frame_t on_datagram_cb;
     QuicConn                       *conns[MAX_CONNS];
     int                             is_server;
+    int                             in_receive;
+    int                             pending_flush;
     quicly_cid_plaintext_t          next_cid;
     JSValue                         callbacks[QS_CB_COUNT];
 };
@@ -107,6 +123,7 @@ static inline quicly_conn_t *qc_get_native(JSContext *ctx, JSValue val) {
 
 /* Get QuicConn from a JS QuicConnection object. */
 static inline QuicConn *qc_conn_from_js(JSContext *ctx, JSValue val) {
+    (void)ctx;
     return JS_GetOpaque(val, qc_conn_class_id);
 }
 

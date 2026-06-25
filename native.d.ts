@@ -33,9 +33,9 @@ declare namespace CModuleExternalQuic {
         host?: string;
         /** UDP port. Default 4433. */
         port?: number;
-        /** Path to PEM certificate file. */
+        /** PEM certificate chain string. */
         cert?: string;
-        /** Path to PEM private key file. */
+        /** PEM private key string. */
         key?: string;
         /** Whether to act as server (bind + accept). Default false. */
         isServer?: boolean;
@@ -128,13 +128,15 @@ declare namespace CModuleExternalQuic {
          *
          * @example
          * import { Socket } from "npm:@cnojs/quic"
-         * 
-         * // Server
+         *
+         * // Server — cert and key are PEM strings
+         * const cert = await Deno.readTextFile("./cert.pem");
+         * const key  = await Deno.readTextFile("./key.pem");
          * const sock = new Socket({ isServer: true, port: 4433, cert, key });
          * sock.onconnection = conn => { conn.ondata = (id, chunk, fin) => { ... }; };
          *
          * // Client
-         * const sock = new Socket({ cert, key });
+         * const sock = new Socket();
          * const conn = sock.connect("example.com", 4433);
          * conn.onconnected = () => { const id = conn.openStream(); ... };
          */
