@@ -15,13 +15,13 @@ declare namespace CModuleExternalQuic {
         maxStreamsBidi?: number;
         /** Max concurrent uni streams peer can open. Default 100. */
         maxStreamsUni?: number;
-        /** Per-stream receive window (bytes). Default 256KB. */
+        /** Per-stream receive window (bytes). Uses backend defaults when omitted. */
         maxStreamData?: number;
-        /** Connection-level receive window (bytes). Default 1MB. */
+        /** Connection-level receive window (bytes). Default 16MB. */
         maxData?: number;
         /** Idle timeout in ms. Default 30000. */
         idleTimeoutMs?: number;
-        /** Initial RTT estimate in ms. Default 333. */
+        /** Initial RTT estimate in ms. Default 66. */
         initialRttMs?: number;
         /** Congestion control algorithm. Default "reno". */
         cc?: "reno" | "cubic" | "pico";
@@ -29,9 +29,9 @@ declare namespace CModuleExternalQuic {
 
     /* ── QuicSocket options ──────────────────────────────────────── */
     interface SocketOptions {
-        /** Bind/connect host. Default "0.0.0.0" for server. */
+        /** Server bind host. Default "0.0.0.0". */
         host?: string;
-        /** UDP port. Default 4433. */
+        /** Server bind port. Default 4433. */
         port?: number;
         /** PEM certificate chain string. */
         cert?: string;
@@ -43,6 +43,10 @@ declare namespace CModuleExternalQuic {
         alpn?: string;
         /** QUIC transport parameters. */
         transport?: TransportParams;
+        /** Verify the peer certificate using the platform trust store. */
+        verifyPeer?: boolean;
+        /** Additional PEM root certificates used when verifyPeer is enabled. */
+        caCerts?: string[];
     }
 
     /* ── Stats ───────────────────────────────────────────────────── */
@@ -66,13 +70,9 @@ declare namespace CModuleExternalQuic {
         /**
          * Open a new stream.
          * @param bidirectional default true
-         * @param priority      urgency 0(highest)–7(lowest), incremental for fairness
          * @returns stream id
          */
-        openStream(bidirectional?: boolean, priority?: {
-            urgency?: number;  /* 0–7, default 3 */
-            incremental?: boolean; /* default false  */
-        }): number;
+        openStream(bidirectional?: boolean): number;
 
         /**
          * Write data to a stream.
@@ -105,6 +105,9 @@ declare namespace CModuleExternalQuic {
 
         /** Peer reset a stream (RESET_STREAM). args: (streamId, errorCode) */
         onstreamreset: Callback<[streamId: number, errorCode: number]> | null;
+
+        /** Peer stopped a send stream (STOP_SENDING). args: (streamId, errorCode) */
+        onstreamstop: Callback<[streamId: number, errorCode: number]> | null;
 
         /** Unreliable datagram received. args: (chunk) */
         ondatagram: Callback<[chunk: Uint8Array]> | null;
@@ -147,7 +150,10 @@ declare namespace CModuleExternalQuic {
          * Returns the QuicConnection immediately (handshake runs async).
          * Listen to onconnected before sending data.
          */
-        connect(host: string, port?: number): Connection;
+        connect(host: string, port?: number, serverName?: string): Connection;
+
+        /** Stop UDP/timer handles (idempotent). */
+        close(): void;
 
         /** New inbound connection (server mode). args: (conn) */
         onconnection: Callback<[conn: Connection]> | null;
@@ -171,5 +177,5 @@ declare namespace CModuleExternalQuic {
     };
 
     export { Socket, Connection, constants };
-    export type { SocketOptions, Stats, Callback };
+    export type { SocketOptions, TransportParams, Stats, Callback };
 }

@@ -26,10 +26,11 @@ typedef enum {
     QC_CB_STREAM       = 0, /* (streamId: number, bidi: boolean)              */
     QC_CB_DATA         = 1, /* (streamId: number, Uint8Array, fin: boolean)   */
     QC_CB_STREAM_RESET = 2, /* (streamId: number, errorCode: number)          */
-    QC_CB_DATAGRAM     = 3, /* (Uint8Array)                                   */
-    QC_CB_CONNECTED    = 4, /* ()                                             */
-    QC_CB_CLOSE        = 5, /* (errorCode: number, reason: string)            */
-    QC_CB_ERROR        = 6, /* (msg: string)                                  */
+    QC_CB_STREAM_STOP  = 3, /* (streamId: number, errorCode: number)          */
+    QC_CB_DATAGRAM     = 4, /* (Uint8Array)                                   */
+    QC_CB_CONNECTED    = 5, /* ()                                             */
+    QC_CB_CLOSE        = 6, /* (errorCode: number, reason: string)            */
+    QC_CB_ERROR        = 7, /* (msg: string)                                  */
     QC_CB_COUNT
 } QcConnCbIdx;
 
@@ -41,24 +42,39 @@ typedef enum {
 } QcSockCbIdx;
 
 /* ── tjs-style callback invoke ────────────────────────────────── */
-static inline JSValue qc_call_cb(JSContext *ctx, JSValue cb,
-                                  int argc, JSValue *argv) {
-    if (JS_IsFunction(ctx, cb))
-        return JS_Call(ctx, cb, JS_UNDEFINED, argc, argv);
-    if (!JS_IsArray(cb)) return JS_UNDEFINED;
-    JSValue fn   = JS_GetPropertyUint32(ctx, cb, 0);
-    JSValue self = JS_GetPropertyUint32(ctx, cb, 1);
-    JSValue ret  = JS_Call(ctx, fn, self, argc, argv);
-    JS_FreeValue(ctx, fn);
-    JS_FreeValue(ctx, self);
-    return ret;
+static inline void qc_call_cb(JSContext *ctx, JSValue cb,
+                              int argc, JSValue *argv) {
+    if (JS_HasException(ctx)) {
+        TJS_DumpException(ctx);
+        return;
+    }
+    JSValue holder = JS_DupValue(ctx, cb);
+    JSValue ret = JS_UNDEFINED;
+    if (JS_IsFunction(ctx, holder)) {
+        ret = JS_Call(ctx, holder, JS_UNDEFINED, argc, argv);
+    } else {
+        int is_array = JS_IsArray(holder);
+        if (is_array <= 0) {
+            JS_FreeValue(ctx, holder);
+            if (is_array < 0) TJS_DumpException(ctx);
+            return;
+        }
+        JSValue fn = JS_GetPropertyUint32(ctx, holder, 0);
+        JSValue self = JS_UNDEFINED;
+        if (!JS_IsException(fn)) self = JS_GetPropertyUint32(ctx, holder, 1);
+        if (!JS_IsException(fn) && !JS_IsException(self))
+            ret = JS_Call(ctx, fn, self, argc, argv);
+        JS_FreeValue(ctx, fn);
+        JS_FreeValue(ctx, self);
+    }
+    JS_FreeValue(ctx, holder);
+    if (JS_IsException(ret) || JS_HasException(ctx)) TJS_DumpException(ctx);
+    JS_FreeValue(ctx, ret);
 }
 
 #define QC_CALL(ctx, cbs, idx, argc, argv) \
     do { \
-        JSValue _r = qc_call_cb(ctx, (cbs)[idx], argc, argv); \
-        if (JS_IsException(_r)) TJS_DumpException(ctx); \
-        JS_FreeValue(ctx, _r); \
+        qc_call_cb(ctx, (cbs)[idx], argc, argv); \
     } while(0)
 
 #define container_of(ptr, type, member) \
@@ -82,6 +98,7 @@ struct QuicConn {
     JSContext     *ctx;
     JSValue        self;
     JSValue        callbacks[QC_CB_COUNT];
+    int            connected_fired; /* onconnected once */
 };
 
 typedef struct QuicStreamData {
@@ -98,6 +115,7 @@ struct QuicSock {
     ptls_context_t                  tls;
     ptls_on_client_hello_t          on_client_hello_cb;
     ptls_openssl_sign_certificate_t sign_cert;
+    ptls_openssl_verify_certificate_t verify_cert;
     ptls_iovec_t                    certs[8];
     size_t                          ncerts;
     char                           *alpn_storage;
@@ -109,6 +127,13 @@ struct QuicSock {
     int                             is_server;
     int                             in_receive;
     int                             pending_flush;
+    int                             closing;      /* close() / finalizer started */
+    int                             close_finished;
+    int                             handles_open; /* uv_udp + uv_timer still live */
+    int                             pending_sends;
+    int                             udp_initialized;
+    int                             timer_initialized;
+    int                             verify_initialized;
     quicly_cid_plaintext_t          next_cid;
     JSValue                         callbacks[QS_CB_COUNT];
 };
