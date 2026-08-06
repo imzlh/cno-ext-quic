@@ -708,7 +708,11 @@ static JSClassDef qc_conn_class = {
 };
 
 static inline QuicConn *conn_get(JSContext *ctx, JSValue v) {
-    return JS_GetOpaque2(ctx, v, qc_conn_class_id);
+    QuicConn *c = JS_GetOpaque2(ctx, v, qc_conn_class_id);
+    /* opaque is cleared on dispose; JS_GetOpaque2 only throws on class mismatch */
+    if (!c && !JS_HasException(ctx))
+        JS_ThrowTypeError(ctx, "QUIC connection is closed");
+    return c;
 }
 
 static int qconn_operation_enter(JSContext *ctx, JSValue this_val,
@@ -1179,7 +1183,11 @@ static JSClassDef qc_sock_class = {
 };
 
 static inline QuicSock *sock_get(JSContext *ctx, JSValue v) {
-    return JS_GetOpaque2(ctx, v, qc_sock_class_id);
+    QuicSock *s = JS_GetOpaque2(ctx, v, qc_sock_class_id);
+    /* opaque is cleared on close; JS_GetOpaque2 only throws on class mismatch */
+    if (!s && !JS_HasException(ctx))
+        JS_ThrowTypeError(ctx, "QUIC socket is closed");
+    return s;
 }
 
 static int qsock_operation_enter(JSContext *ctx, JSValue this_val,
@@ -1306,7 +1314,7 @@ static JSValue js_sock_ctor(JSContext *ctx, JSValue new_target,
     JSValue obj      = JS_UNDEFINED;
     const char *host = NULL, *cert = NULL, *key = NULL, *alpn_str = NULL;
     uint32_t port = 4433;
-    int verify_peer = 0;
+    int verify_peer = 1;
     int uv_rc = 0;
 
     QuicSock *s = tjs__mallocz(sizeof(*s));
@@ -1322,7 +1330,7 @@ static JSValue js_sock_ctor(JSContext *ctx, JSValue new_target,
         opt_str(ctx, opts, "alpn", &alpn_str) < 0 ||
         opt_u32(ctx, opts, "port", 4433, &port) < 0 ||
         opt_bool(ctx, opts, "isServer", 0, &s->is_server) < 0 ||
-        opt_bool(ctx, opts, "verifyPeer", 0, &verify_peer) < 0)
+        opt_bool(ctx, opts, "verifyPeer", verify_peer, &verify_peer) < 0)
         goto fail;
     if (port > 65535) {
         JS_ThrowRangeError(ctx, "port must be between 0 and 65535");
@@ -1467,6 +1475,12 @@ static JSValue js_sock_connect(JSContext *ctx, JSValue this_val,
     if (argc < 1) {
         qsock_operation_leave(ctx, s);
         return JS_ThrowTypeError(ctx, "connect requires a host");
+    }
+    /* A server socket never gets tls.verify_certificate (see js_sock_ctor), so a
+     * client handshake on one would skip chain *and* CertificateVerify checks. */
+    if (s->is_server) {
+        qsock_operation_leave(ctx, s);
+        return JS_ThrowTypeError(ctx, "connect() requires a client socket; a server socket has no peer verification");
     }
 
     JSValue result = JS_EXCEPTION;

@@ -43,9 +43,18 @@ declare namespace CModuleExternalQuic {
         alpn?: string;
         /** QUIC transport parameters. */
         transport?: TransportParams;
-        /** Verify the peer certificate using the platform trust store. */
+        /**
+         * Verify the peer's certificate chain and hostname. Default **true**
+         * (clients only; server sockets never verify — no client-cert support).
+         *
+         * The store comes from OpenSSL's compile-time default paths, which are
+         * **empty on Windows**, so callers must supply `caCerts` there or every
+         * handshake fails closed with UNKNOWN_CA. Use
+         * `cno/src/utils/ca-certs.ts` (`systemCaCerts`/`withSystemCaCerts`) to
+         * read the OS trust store rather than relying on the defaults.
+         */
         verifyPeer?: boolean;
-        /** Additional PEM root certificates used when verifyPeer is enabled. */
+        /** Extra PEM roots added to the store on top of the default paths. */
         caCerts?: string[];
     }
 
