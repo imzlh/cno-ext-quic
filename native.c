@@ -157,12 +157,26 @@ typedef struct {
 static void on_udp_sent(uv_udp_send_t *req, int status) {
     SendReq *send = (SendReq *)req;
     QuicSock *s = send->sock;
-    if (status < 0 && s && !s->closing) {
-        qsock_emit_error(s, uv_strerror(status));
-        if (s->closing) qsock_close(JS_GetRuntime(s->ctx), s);
+    if (!s) {
+        free(send);
+        return;
     }
+
+    /* The completion callback may invoke JS (and user code may close the
+     * socket from there).  Pin the socket until both the callback and the
+     * pending-send accounting are complete. */
+    s->in_receive++;
+    if (status < 0 && !s->closing)
+        qsock_emit_error(s, uv_strerror(status));
+
     s->pending_sends--;
     free(send);
+
+    s->in_receive--;
+    if (s->closing && !s->close_finished) {
+        qsock_close(JS_GetRuntime(s->ctx), s);
+        return;
+    }
     qsock_try_free(s);
 }
 
@@ -179,9 +193,15 @@ static void qsock_udp_send(QuicSock *s, const struct sockaddr *dest,
     s->pending_sends++;
     int rc = uv_udp_send(&req->req, &s->udp, &buf, 1, dest, on_udp_sent);
     if (rc != 0) {
-        s->pending_sends--;
+        /* Keep the request counted while reporting the error: the callback can
+         * re-enter JS and close the socket, and the count pins QuicSock until
+         * that re-entry has returned.  uv_udp_send does not invoke on_udp_sent
+         * when it returns an error synchronously. */
         qsock_emit_error(s, uv_strerror(rc));
         free(req);
+        s->pending_sends--;
+        /* Do not free here.  qconn_flush may still be using s after this helper
+         * returns; a pending uv close callback will perform the final free. */
     }
 }
 
@@ -245,6 +265,19 @@ static quicly_error_t qconn_flush(QuicConn *c) {
     }
     qsock_update_timer(s);
     return 0;
+}
+
+/* A receive callback can re-enter JS and request another flush.  Keep that
+ * work deferred until the outer UDP callback has dropped its lifetime pin. */
+static void qsock_flush_pending(QuicSock *s) {
+    while (s && !s->closing && s->pending_flush && !s->in_receive) {
+        s->pending_flush = 0;
+        for (int i = 0; i < MAX_CONNS; i++) {
+            QuicConn *c = s->conns[i];
+            if (c) qconn_flush(c);
+            if (s->closing) break;
+        }
+    }
 }
 
 /* ── Timer ────────────────────────────────────────────────────── */
@@ -411,14 +444,18 @@ static void on_udp_recv(uv_udp_t *h, ssize_t nread, const uv_buf_t *buf,
                          const struct sockaddr *addr, unsigned flags) {
     (void)flags;
     QuicSock *s = container_of(h, QuicSock, udp);
+    /* Keep the socket and its connection table alive across every operation in
+     * this callback.  Native callbacks can re-enter JS, where user code may
+     * drop the last Socket reference and run its finalizer synchronously. */
+    s->in_receive++;
+    if (s->closing) goto cleanup;
     if (nread <= 0) {
-        free(buf->base);
         if (nread < 0) {
             qsock_emit_error(s, uv_strerror((int)nread));
-            if (s->closing) qsock_close(JS_GetRuntime(s->ctx), s);
         }
-        return;
+        goto cleanup;
     }
+    if (!addr) goto cleanup;
 
     /* Decode packet to find/create connection */
     quicly_decoded_packet_t pkt;
@@ -477,11 +514,7 @@ static void on_udp_recv(uv_udp_t *h, ssize_t nread, const uv_buf_t *buf,
                     free(c);
                     TJS_DumpException(s->ctx);
                     qsock_emit_error(s, "failed to allocate QUIC connection object");
-                    if (s->closing) {
-                        qsock_close(JS_GetRuntime(s->ctx), s);
-                        free(buf->base);
-                        return;
-                    }
+                    if (s->closing) goto cleanup;
                     continue;
                 }
                 JS_SetOpaque(c->self, c);
@@ -491,18 +524,13 @@ static void on_udp_recv(uv_udp_t *h, ssize_t nread, const uv_buf_t *buf,
                 QC_CALL(s->ctx, s->callbacks, QS_CB_CONNECTION, 1, &jconn);
                 s->in_receive--;
                 JS_FreeValue(s->ctx, jconn);
-                if (s->closing) {
-                    qsock_close(JS_GetRuntime(s->ctx), s);
-                    free(buf->base);
-                    return;
-                }
+                if (s->closing) goto cleanup;
                 qconn_flush(c);
                 continue;
             }
 
             if (!c) continue; /* client: unknown packet, drop */
 
-            s->in_receive++;
             quicly_error_t receive_rc = quicly_receive(c->qconn, NULL, &remote.sa, &pkt);
 
             /* Notify JS once when handshake completes */
@@ -510,25 +538,13 @@ static void on_udp_recv(uv_udp_t *h, ssize_t nread, const uv_buf_t *buf,
                 c->connected_fired = 1;
                 QC_CALL(s->ctx, c->callbacks, QC_CB_CONNECTED, 0, NULL);
             }
-            s->in_receive--;
-            if (s->closing) {
-                qsock_close(JS_GetRuntime(s->ctx), s);
-                free(buf->base);
-                return;
-            }
+            if (s->closing) goto cleanup;
             if (receive_rc == QUICLY_ERROR_FREE_CONNECTION) {
                 if (!c->connected_fired)
                     qconn_emit_error(c, "QUIC connection closed during handshake");
-                if (s->closing) {
-                    qsock_close(JS_GetRuntime(s->ctx), s);
-                    free(buf->base);
-                    return;
-                }
+                if (s->closing) goto cleanup;
                 qconn_dispose(JS_GetRuntime(s->ctx), c);
-                if (s->closing) {
-                    free(buf->base);
-                    return;
-                }
+                if (s->closing) goto cleanup;
                 continue;
             }
             if (receive_rc != 0 && receive_rc != QUICLY_ERROR_PACKET_IGNORED &&
@@ -536,35 +552,23 @@ static void on_udp_recv(uv_udp_t *h, ssize_t nread, const uv_buf_t *buf,
                 char message[96];
                 snprintf(message, sizeof(message), "QUIC receive failed: %" PRId64, receive_rc);
                 qconn_emit_error(c, message);
-                if (s->closing) {
-                    qsock_close(JS_GetRuntime(s->ctx), s);
-                    free(buf->base);
-                    return;
-                }
+                if (s->closing) goto cleanup;
             }
 
             qconn_flush(c);
-            if (s->closing) {
-                qsock_close(JS_GetRuntime(s->ctx), s);
-                free(buf->base);
-                return;
-            }
-            if (s->pending_flush && !s->in_receive) {
-                s->pending_flush = 0;
-                for (int j = 0; j < MAX_CONNS; j++) {
-                    if (s->conns[j]) qconn_flush(s->conns[j]);
-                    if (s->closing) break;
-                }
-            }
-            if (s->closing) {
-                qsock_close(JS_GetRuntime(s->ctx), s);
-                free(buf->base);
-                return;
-            }
+            if (s->closing) goto cleanup;
         }
         (void)n;
     }
+
+cleanup:
     free(buf->base);
+    if (s->in_receive > 0) s->in_receive--;
+    if (s->closing) {
+        qsock_close(JS_GetRuntime(s->ctx), s);
+    } else {
+        qsock_flush_pending(s);
+    }
 }
 
 /* ── TLS / picotls helpers ────────────────────────────────────── */
@@ -643,8 +647,8 @@ static int load_ca_certificates(JSContext *ctx, JSValue opts, X509_STORE *store)
             return -1;
         }
         BIO *bio = BIO_new_mem_buf(pem, -1);
-        JS_FreeCString(ctx, pem);
         if (!bio) {
+            JS_FreeCString(ctx, pem);
             JS_FreeValue(ctx, roots);
             JS_ThrowOutOfMemory(ctx);
             return -1;
@@ -663,6 +667,9 @@ static int load_ca_certificates(JSContext *ctx, JSValue opts, X509_STORE *store)
             X509_free(cert);
         }
         BIO_free(bio);
+        /* BIO_new_mem_buf borrows its input; keep QuickJS' string storage alive
+         * until the BIO and every PEM_read_bio_X509 call are finished. */
+        JS_FreeCString(ctx, pem);
         ERR_clear_error();
         if (loaded == 0) {
             JS_FreeValue(ctx, roots);
@@ -1111,7 +1118,11 @@ static int opt_present_u32(JSContext *ctx, JSValue obj, const char *k,
 }
 
 static void qsock_try_free(QuicSock *s) {
-    if (s->handles_open > 0 || s->pending_sends > 0) return;
+    /* A close callback or send completion may run while another native stack
+     * frame still holds s (including a JS-reentrant callback).  Never reclaim
+     * the allocation until all such frames have dropped their lifetime pin. */
+    if (!s || !s->close_finished || s->handles_open > 0 ||
+        s->pending_sends > 0 || s->in_receive > 0) return;
     for (size_t i = 0; i < s->ncerts; i++) OPENSSL_free(s->certs[i].base);
     if (s->sign_cert.key) ptls_openssl_dispose_sign_certificate(&s->sign_cert);
     if (s->verify_initialized) ptls_openssl_dispose_verify_certificate(&s->verify_cert);
